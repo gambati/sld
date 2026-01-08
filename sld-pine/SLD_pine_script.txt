@@ -1,0 +1,333 @@
+//@version=6
+// SLD - Benchmark-aligned Causal Structural Leading Divergence (NO BACKPAINT)
+// v7 (frozen): Hybrid lock + bull/bear asymmetric gates + bear spam control +
+//              gated previous-low fallback for Bulls +
+//              debug label limiter (prevents label-count exhaustion)
+//
+// Notes:
+// - Causal: no future bars used.
+// - No-backpaint: labels only created on the bar where the signal is decided.
+// - Debug: shows ONE readable rejection label per lock decision, limited to last N bars.
+
+indicator("SLD (Structural Leading Divergence)", shorttitle="SLD", overlay=false, max_labels_count=500)
+
+// -------------------- Inputs --------------------
+// Keep ONLY these visible in the chart header:
+len        = input.int(14, "RSI Period", minval=1)
+src        = input.source(close, "RSI Source")
+lbL        = input.int(5,  "Pivot Lookback Left (lbL)", minval=1)
+
+
+// Hide the rest from the chart header (still adjustable in settings):
+lockMode   = input.string("Hybrid", "Swing Lock Mode", options=["Bounce", "Hybrid"], display=display.none)
+rsiBounce  = input.float(5.0, "RSI bounce to LOCK swing (pts)", minval=0.1, step=0.1, display=display.none)
+softBounce = input.float(1.5, "Soft bounce for Hybrid lock (pts)", minval=0.1, step=0.1, display=display.none)
+
+// Range between paired swings
+rangeLower = input.int(3,  "Min bars between swings", minval=1, display=display.none)
+rangeUpper = input.int(90, "Max bars between swings", minval=1, display=display.none)
+
+// Amplitude filters
+minPriceMovePct = input.float(0.00, "Min price move between pivots (%)", minval=0.0, step=0.05, display=display.none)
+
+// Separate min RSI movement thresholds
+bullMinRsiMove  = input.float(0.10, "Min RSI move for Bull (pts)", minval=0.0, step=0.1, display=display.none)
+bearMinRsiMove  = input.float(0.50, "Min RSI move for Bear (pts)", minval=0.0, step=0.1, display=display.none)
+
+// Tolerances
+rsiTol      = input.float(0.8, "RSI tolerance for flat divergences (pts)", minval=0.0, step=0.1, display=display.none)
+priceTolPct = input.float(0.10, "Price tolerance for LL/HH (%)", minval=0.0, step=0.05, display=display.none)
+
+// Controlled relaxed-bear gating (prevents bearish spam when RSI is flat)
+minBearHHpct = input.float(0.15, "Min HH size for Bear (%) when RSI is flat", minval=0.0, step=0.05, display=display.none)
+
+// Bull previous-low fallback (gated to avoid noise)
+useBullPrevFallback = input.bool(true, "Bull: enable previous-low fallback", display=display.none)
+maxBarsPrevToLast   = input.int(30, "Bull fallback: max bars prevLow→lastLow", minval=1, display=display.none)
+minorLowPricePct    = input.float(0.25, "Bull fallback: lastLow minor if ΔPrice vs prevLow ≤ (%)", minval=0.0, step=0.05, display=display.none)
+minorLowRsiPts      = input.float(1.0,  "Bull fallback: lastLow minor if ΔRSI vs prevLow ≤ (pts)", minval=0.0, step=0.1, display=display.none)
+maxBarsLastToCurr   = input.int(40, "Bull fallback: max bars lastLow→currentLow", minval=1, display=display.none)
+
+// Visuals
+showStream    = input.bool(false, "Show candidate stream triangles", display=display.none)
+showLabels    = input.bool(true,  "Show final labels (fBull/fBear)")
+showDebug     = input.bool(false, "Debug: show rejection reason labels")
+debugBars     = input.int(400, "Debug: show only last N bars", minval=50, maxval=5000, display=display.none)
+debugYOffset  = input.float(10.0, "Debug vertical offset (RSI points)", step=1.0, display=display.none)
+
+// Colors
+bullColor = color.lime
+bearColor = color.red
+txtColor  = color.white
+
+// -------------------- Core --------------------
+osc = ta.rsi(src, len)
+plot(osc, "RSI", color=color.new(color.blue, 0))
+hline(70), hline(50), hline(30)
+
+// -------------------- lbL-only candidate pivot flags --------------------
+candPL = true
+for i = 1 to lbL
+    candPL := candPL and (osc <= osc[i])
+
+candPH = true
+for i = 1 to lbL
+    candPH := candPH and (osc >= osc[i])
+
+// Track run ends (for Hybrid lock)
+var bool prevCandPL = false
+var bool prevCandPH = false
+runEndPL = prevCandPL and not candPL
+runEndPH = prevCandPH and not candPH
+prevCandPL := candPL
+prevCandPH := candPH
+
+// -------------------- Helpers --------------------
+inRangeBars(b) =>
+    b >= rangeLower and b <= rangeUpper
+
+pctMove(fromPx, toPx) =>
+    fromPx == 0.0 ? 0.0 : math.abs((toPx - fromPx) / fromPx) * 100.0
+
+// -------------------- Swing state --------------------
+var bool  pendingLow = false
+var float pendLowRSI = na
+var float pendLowPx  = na
+var int   pendLowBar = na
+
+var bool  pendingHigh = false
+var float pendHighRSI = na
+var float pendHighPx  = na
+var int   pendHighBar = na
+
+var float lastLowRSI = na
+var float lastLowPx  = na
+var int   lastLowBar = na
+
+var float prevLowRSI = na
+var float prevLowPx  = na
+var int   prevLowBar = na
+
+var float lastHighRSI = na
+var float lastHighPx  = na
+var int   lastHighBar = na
+
+// -------------------- Candidate stream (optional) --------------------
+plotshape(showStream and candPL ? osc : na, title="Candidate Low stream",
+     style=shape.triangleup, location=location.absolute, color=color.new(bullColor, 0), size=size.tiny)
+
+plotshape(showStream and candPH ? osc : na, title="Candidate High stream",
+     style=shape.triangledown, location=location.absolute, color=color.new(bearColor, 0), size=size.tiny)
+
+// -------------------- Update pending LOW swing --------------------
+if candPL
+    if not pendingLow
+        pendingLow := true
+        pendLowRSI := osc
+        pendLowPx  := low
+        pendLowBar := bar_index
+    else
+        if osc < pendLowRSI
+            pendLowRSI := osc
+            pendLowPx  := low
+            pendLowBar := bar_index
+
+// -------------------- Update pending HIGH swing --------------------
+if candPH
+    if not pendingHigh
+        pendingHigh := true
+        pendHighRSI := osc
+        pendHighPx  := high
+        pendHighBar := bar_index
+    else
+        if osc > pendHighRSI
+            pendHighRSI := osc
+            pendHighPx  := high
+            pendHighBar := bar_index
+
+// -------------------- Hybrid lock logic --------------------
+lowLock = false
+if pendingLow and not na(pendLowRSI)
+    strong = (osc - pendLowRSI) >= rsiBounce
+    soft   = runEndPL and (osc - pendLowRSI) >= softBounce
+    lowLock := lockMode == "Bounce" ? strong : (strong or soft)
+
+highLock = false
+if pendingHigh and not na(pendHighRSI)
+    strong = (pendHighRSI - osc) >= rsiBounce
+    soft   = runEndPH and (pendHighRSI - osc) >= softBounce
+    highLock := lockMode == "Bounce" ? strong : (strong or soft)
+
+// -------------------- Divergence detection (NO BACKPAINT) --------------------
+bullSignal = false
+bearSignal = false
+
+var string rejLow  = ""
+var string rejHigh = ""
+rejLow  := ""
+rejHigh := ""
+
+// ---- LOCK LOW -> bullish divergence (lastLow, with gated prevLow fallback) ----
+if lowLock
+    condBullLast = false
+    condBullPrev = false
+
+    var string rejLowLocal = ""
+    rejLowLocal := ""
+
+    // Evaluate vs lastLow
+    if not na(lastLowBar) and not na(pendLowBar)
+        barsBetween = pendLowBar - lastLowBar
+        okRange = inRangeBars(barsBetween)
+
+        priceMoveOk = pctMove(lastLowPx, pendLowPx) >= minPriceMovePct
+        rsiDelta    = math.abs(pendLowRSI - lastLowRSI)
+        rsiMoveOk   = rsiDelta >= bullMinRsiMove
+
+        isLL = pendLowPx <= lastLowPx * (1 + priceTolPct/100)
+        isHL = pendLowRSI >= lastLowRSI - rsiTol
+
+        condBullLast := okRange and priceMoveOk and rsiMoveOk and isLL and isHL
+
+        if showDebug and not condBullLast
+            if not okRange
+                rejLowLocal := "REJ:range"
+            else if not priceMoveOk
+                rejLowLocal := "REJ:price%<"
+            else if not rsiMoveOk
+                rejLowLocal := "REJ:rsiΔ<"
+            else if not isLL
+                rejLowLocal := "REJ:notLL"
+            else if not isHL
+                rejLowLocal := "REJ:notHL"
+            else
+                rejLowLocal := "REJ:other"
+    else if showDebug
+        rejLowLocal := "REJ:firstLow"
+
+    // GATED fallback vs prevLow (only if lastLow is "minor")
+    if useBullPrevFallback and not condBullLast and not na(prevLowBar) and not na(lastLowBar) and not na(pendLowBar)
+        barsPrevToLast = lastLowBar - prevLowBar
+        barsLastToCurr = pendLowBar - lastLowBar
+
+        minorByPrice = pctMove(prevLowPx, lastLowPx) <= minorLowPricePct
+        minorByRSI   = math.abs(prevLowRSI - lastLowRSI) <= minorLowRsiPts
+        lastIsMinor  = (barsPrevToLast <= maxBarsPrevToLast) and (minorByPrice or minorByRSI)
+
+        currAtOrBelowLast = pendLowPx <= lastLowPx * (1 + priceTolPct/100)
+        okSkip = lastIsMinor and currAtOrBelowLast and (barsLastToCurr <= maxBarsLastToCurr)
+
+        if okSkip
+            barsBetweenP = pendLowBar - prevLowBar
+            okRangeP = inRangeBars(barsBetweenP)
+
+            priceMoveOkP = pctMove(prevLowPx, pendLowPx) >= minPriceMovePct
+            rsiDeltaP    = math.abs(pendLowRSI - prevLowRSI)
+            rsiMoveOkP   = rsiDeltaP >= bullMinRsiMove
+
+            isLLP = pendLowPx <= prevLowPx * (1 + priceTolPct/100)
+            isHLP = pendLowRSI >= prevLowRSI - rsiTol
+
+            condBullPrev := okRangeP and priceMoveOkP and rsiMoveOkP and isLLP and isHLP
+
+    if condBullLast or condBullPrev
+        bullSignal := true
+    else if showDebug and rejLowLocal != ""
+        rejLow := rejLowLocal
+
+    // Shift lastLow -> prevLow BEFORE overwriting lastLow
+    if not na(lastLowBar)
+        prevLowRSI := lastLowRSI
+        prevLowPx  := lastLowPx
+        prevLowBar := lastLowBar
+
+    // Update last locked LOW and clear pending
+    lastLowRSI := pendLowRSI
+    lastLowPx  := pendLowPx
+    lastLowBar := pendLowBar
+
+    pendingLow := false
+    pendLowRSI := na
+    pendLowPx  := na
+    pendLowBar := na
+
+// ---- LOCK HIGH -> bearish divergence ----
+if highLock
+    if not na(lastHighBar) and not na(pendHighBar)
+        barsBetween = pendHighBar - lastHighBar
+        okRange = inRangeBars(barsBetween)
+
+        priceMoveOk = pctMove(lastHighPx, pendHighPx) >= minPriceMovePct
+        rsiDelta    = math.abs(pendHighRSI - lastHighRSI)
+        rsiMoveOk   = rsiDelta >= bearMinRsiMove
+
+        isHH = pendHighPx >= lastHighPx * (1 - priceTolPct/100)
+        isLHish = pendHighRSI <= lastHighRSI + rsiTol
+
+        hhPct = pctMove(lastHighPx, pendHighPx)
+
+        strictBear  = okRange and priceMoveOk and rsiMoveOk and (pendHighPx > lastHighPx) and (pendHighRSI < lastHighRSI)
+        relaxedBear = okRange and isHH and isLHish and (hhPct >= minBearHHpct) and (rsiDelta < bearMinRsiMove)
+
+        condBear = strictBear or relaxedBear
+
+        if condBear
+            bearSignal := true
+        else if showDebug
+            if not okRange
+                rejHigh := "REJ:range"
+            else if not priceMoveOk
+                rejHigh := "REJ:price%<"
+            else if not rsiMoveOk
+                rejHigh := "REJ:rsiΔ<"
+            else if not isHH
+                rejHigh := "REJ:notHH"
+            else if not isLHish
+                rejHigh := "REJ:notLH"
+            else if hhPct < minBearHHpct
+                rejHigh := "REJ:HH%<"
+            else
+                rejHigh := "REJ:other"
+    else if showDebug
+        rejHigh := "REJ:firstHigh"
+
+    lastHighRSI := pendHighRSI
+    lastHighPx  := pendHighPx
+    lastHighBar := pendHighBar
+
+    pendingHigh := false
+    pendHighRSI := na
+    pendHighPx  := na
+    pendHighBar := na
+
+// -------------------- Final labels (NO BACKPAINT) --------------------
+if showLabels and bullSignal
+    label.new(bar_index, osc, "fBull", style=label.style_label_up, color=bullColor, textcolor=txtColor, size=size.small)
+
+if showLabels and bearSignal
+    label.new(bar_index, osc, "fBear", style=label.style_label_down, color=bearColor, textcolor=txtColor, size=size.small)
+
+// -------------------- Debug labels (limited to last N bars) --------------------
+showDebugNow = showDebug and (bar_index > last_bar_index - debugBars)
+
+if showDebugNow and rejLow != ""
+    label.new(
+        bar_index,
+        math.min(osc + debugYOffset, 95),
+        "L " + rejLow,
+        style=label.style_label_down,
+        color=color.new(color.yellow, 0),
+        textcolor=color.black,
+        size=size.small
+    )
+
+if showDebugNow and rejHigh != ""
+    label.new(
+        bar_index,
+        math.max(osc - debugYOffset, 5),
+        "H " + rejHigh,
+        style=label.style_label_up,
+        color=color.new(color.yellow, 0),
+        textcolor=color.black,
+        size=size.small
+    )
