@@ -9,7 +9,8 @@ Used for Section 4.5 and 4.6 of the PhD thesis.
 """
 import pandas as pd
 import numpy as np
-
+import openpyxl
+import datetime
 INFILE = "RSID_GA_NIFTY_Daily_Observations.xlsx"
 OUTFILE = "RSID_GA_NIFTY_Daily_Observations_exit_v5_sagarlogic_v52.xlsx"
 
@@ -151,6 +152,65 @@ def derive_exit_sagar_v52(prices, rsi, entry_idx, trade_type):
     return prices.at[end_idx, "Date"], float(prices.at[end_idx, "Close"]), REASON_MH
 
 
+
+DATE_FMT = "DD/MM/YYYY"
+
+def apply_excel_date_format(xlsx_path: str):
+    """Force dd/mm/yyyy display for all date columns in both sheets."""
+    wb = openpyxl.load_workbook(xlsx_path)
+    # Columns in OBS_SHEET that should be treated as dates (if present)
+    obs_date_cols = {
+        "Confirmation Date",
+        "SLD_Date",
+        "T1_TV_Date ",
+        "T1_TV_Date",
+        "TLI_Date (TTLI)",
+        "TLI_Date",
+        "Entry_Date_Analyst",
+        "Exit_Date_Analyst",
+        "Entry_Date_SLD",
+        "Entry_Date_TV",
+        "Entry_Date_TLI",
+    }
+
+    def format_sheet(ws, date_headers: set[str]):
+        # header row assumed to be row 1
+        headers = {}
+        for col in range(1, ws.max_column + 1):
+            v = ws.cell(row=1, column=col).value
+            if isinstance(v, str):
+                headers[v.strip()] = col
+
+        for h in date_headers:
+            if h in headers:
+                c = headers[h]
+                for r in range(2, ws.max_row + 1):
+                    cell = ws.cell(row=r, column=c)
+                    if cell.value is None:
+                        continue
+                    # If it's a datetime/date, just format; if it's a string that looks like a date, try parse.
+                    if isinstance(cell.value, (datetime.date, datetime.datetime)):
+                        cell.number_format = DATE_FMT
+                    elif isinstance(cell.value, str):
+                        try:
+                            dt = pd.to_datetime(cell.value, dayfirst=True, errors="raise")
+                            cell.value = dt.to_pydatetime()
+                            cell.number_format = DATE_FMT
+                        except Exception:
+                            pass
+
+    # OBS sheet
+    if OBS_SHEET in wb.sheetnames:
+        format_sheet(wb[OBS_SHEET], obs_date_cols)
+
+    # PRICES sheet: Date column
+    if PRICES_SHEET in wb.sheetnames:
+        ws = wb[PRICES_SHEET]
+        format_sheet(ws, {"Date"})
+
+    wb.save(xlsx_path)
+
+
 def main():
     obs = pd.read_excel(INFILE, sheet_name=OBS_SHEET)
     prices = pd.read_excel(INFILE, sheet_name=PRICES_SHEET)
@@ -239,9 +299,12 @@ def main():
     obs["Delta_SLD_vs_TV_%"] = obs["Profit_SLD_%"] - obs["Profit_TV_%"]
     obs["Delta_TLI_vs_Manual_%"] = obs["Profit_TLI_%"] - obs["Profit_%"]
 
-    with pd.ExcelWriter(OUTFILE, engine="openpyxl") as w:
+    with pd.ExcelWriter(OUTFILE, engine="openpyxl", datetime_format="DD/MM/YYYY", date_format="DD/MM/YYYY") as w:
         obs.to_excel(w, sheet_name=OBS_SHEET, index=False)
         prices.to_excel(w, sheet_name=PRICES_SHEET, index=False)
+
+    # enforce display format in Excel (pandas can still leave some columns as General)
+    apply_excel_date_format(OUTFILE)
 
     print("Wrote:", OUTFILE)
 
