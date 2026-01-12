@@ -1,3 +1,12 @@
+"""
+derive_exit_and_profitability_sagar_logic.py
+
+Implements rule-based exit logic for divergence trades based on
+Dr. Sagar Bansal's RSI exhaustion and breakeven principles, and
+computes realized profitability for Manual, SLD, TradingView, and TLI signals.
+
+Used for Section 4.5 and 4.6 of the PhD thesis.
+"""
 import pandas as pd
 import numpy as np
 
